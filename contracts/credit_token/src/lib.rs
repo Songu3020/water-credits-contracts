@@ -51,6 +51,20 @@ pub enum DataKey {
     Metadata,
     Cert(u64),
     CertCount,
+    Paused,
+}
+
+fn is_paused(e: &Env) -> bool {
+    e.storage()
+        .instance()
+        .get(&DataKey::Paused)
+        .unwrap_or(false)
+}
+
+fn require_not_paused(e: &Env) {
+    if is_paused(e) {
+        panic!("contract is paused");
+    }
 }
 
 fn has_admin(e: &Env) -> bool {
@@ -167,11 +181,36 @@ impl CreditToken {
             .set(&DataKey::RetirementRegistry, &registry);
     }
 
+    /// Pause all token operations (mint, transfer, retire). Admin only.
+    /// Useful for emergency halts or project suspension.
+    pub fn pause(e: Env, admin: Address) {
+        admin.require_auth();
+        if admin != read_admin(&e) {
+            panic!("unauthorized");
+        }
+        e.storage().instance().set(&DataKey::Paused, &true);
+    }
+
+    /// Resume token operations after a pause. Admin only.
+    pub fn unpause(e: Env, admin: Address) {
+        admin.require_auth();
+        if admin != read_admin(&e) {
+            panic!("unauthorized");
+        }
+        e.storage().instance().set(&DataKey::Paused, &false);
+    }
+
+    /// Returns true if the contract is currently paused.
+    pub fn paused(e: Env) -> bool {
+        is_paused(&e)
+    }
+
     /// Mint new credits to a beneficiary. Callable by admin or designated minter.
     pub fn mint_to(e: Env, minter: Address, to: Address, amount: i128) {
         if amount <= 0 {
             panic!("amount must be positive");
         }
+        require_not_paused(&e);
         require_minter(&e, &minter);
 
         let balance = read_balance(&e, &to);
@@ -219,6 +258,7 @@ impl CreditToken {
         if amount <= 0 {
             panic!("amount must be positive");
         }
+        require_not_paused(&e);
         from.require_auth();
 
         let from_balance = read_balance(&e, &from);
@@ -237,6 +277,7 @@ impl CreditToken {
         if amount <= 0 {
             panic!("amount must be positive");
         }
+        require_not_paused(&e);
         spender.require_auth();
 
         let allowance = read_allowance(&e, &from, &spender);
@@ -273,6 +314,7 @@ impl CreditToken {
         if amount <= 0 {
             panic!("amount must be positive");
         }
+        require_not_paused(&e);
         holder.require_auth();
 
         let balance = read_balance(&e, &holder);
@@ -632,5 +674,62 @@ mod tests {
         assert_eq!(client.balance(&buyer), 500);
         assert_eq!(client.total_retired(), 500);
         assert_eq!(client.total_supply(), 4500);
+    }
+
+    #[test]
+    fn test_pause_blocks_mint() {
+        let (e, admin, user, _, _project_id, client) = setup();
+        e.mock_all_auths();
+
+        client.pause(&admin);
+        assert!(client.paused());
+
+        let result = std::panic::catch_unwind(|| {
+            client.mint_to(&admin, &user, &100);
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_pause_blocks_transfer() {
+        let (e, admin, user1, user2, _project_id, client) = setup();
+        e.mock_all_auths();
+
+        client.mint_to(&admin, &user1, &1000);
+        client.pause(&admin);
+
+        let result = std::panic::catch_unwind(|| {
+            client.transfer(&user1, &user2, &100);
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_unpause_restores_operations() {
+        let (e, admin, user, _, _project_id, client) = setup();
+        e.mock_all_auths();
+
+        client.pause(&admin);
+        assert!(client.paused());
+
+        client.unpause(&admin);
+        assert!(!client.paused());
+
+        client.mint_to(&admin, &user, &500);
+        assert_eq!(client.balance(&user), 500);
+    }
+
+    #[test]
+    fn test_paused_state_does_not_affect_reads() {
+        let (e, admin, user, _, _project_id, client) = setup();
+        e.mock_all_auths();
+
+        client.mint_to(&admin, &user, &300);
+        client.pause(&admin);
+
+        // Read-only functions still work while paused
+        assert_eq!(client.balance(&user), 300);
+        assert_eq!(client.total_supply(), 300);
+        assert!(client.paused());
     }
 }
