@@ -110,7 +110,6 @@ impl Governance {
             panic!("already initialized");
         }
         e.storage().instance().set(&DataKey::Admin, &admin);
-        e.storage().instance().set(&DataKey::Admin, &admin);
 
         let config = GovernanceConfig {
             fee_bps: 50,
