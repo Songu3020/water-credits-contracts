@@ -13,6 +13,7 @@ extern crate std;
 const EVENT_MINTED: Symbol = symbol_short!("minted");
 const EVENT_XFER: Symbol = symbol_short!("xfer");
 const EVENT_RETIRED: Symbol = symbol_short!("retired");
+const EVENT_BURNED: Symbol = symbol_short!("burned");
 
 // ── Data Types ──
 
@@ -327,6 +328,8 @@ impl CreditToken {
         }
         save_balance(&e, &from, balance - amount);
         save_total_supply(&e, total - amount);
+
+        e.events().publish((EVENT_BURNED,), (from, amount));
     }
 
     /// Transfer credits between wallets.
@@ -576,6 +579,23 @@ mod tests {
 
         assert_eq!(client.balance(&user), 700);
         assert_eq!(client.total_supply(), 700);
+    }
+
+    #[test]
+    fn test_burn_emits_event() {
+        let (e, admin, user, _, _project_id, client) = setup();
+        e.mock_all_auths();
+
+        client.mint_to(&admin, &user, &1000);
+
+        // Clear events from mint
+        client.burn(&admin, &user, &300);
+
+        let events = e.events().all();
+        assert_eq!(events.len(), 2);
+        let (_contract, topics, _data) = &events.get(1).unwrap();
+        let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, symbol_short!("burned"));
     }
 
     #[test]
