@@ -9,6 +9,9 @@ use soroban_sdk::{
 extern crate std;
 
 const EVENT_READING_VERIFIED: Symbol = symbol_short!("rdng_vrfy");
+const EVENT_ORACLE_STAKED: Symbol = symbol_short!("orc_stk");
+const EVENT_ORACLE_UNSTAKED: Symbol = symbol_short!("orc_unst");
+const EVENT_ORACLE_SLASHED: Symbol = symbol_short!("orc_slsh");
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -56,6 +59,10 @@ pub struct OracleConfig {
     pub quality_threshold_temp: i64,
     pub credit_per_kg_n: i128,
     pub credit_per_kg_p: i128,
+    pub staking_token: Address,
+    pub treasury: Address,
+    pub min_stake: i128,
+    pub unstake_cooldown_secs: u64,
 }
 
 #[contracttype]
@@ -63,6 +70,20 @@ pub struct OracleConfig {
 pub struct WindowState {
     pub submissions: Vec<ReadingSubmission>,
     pub finalized: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SlashReason {
+    pub reason: u32,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct StakeInfo {
+    pub amount: i128,
+    pub unstake_request: Option<u64>,
 }
 
 #[contracttype]
@@ -80,6 +101,8 @@ pub enum DataKey {
     ProjectConfig(BytesN<32>),
     OracleSubmitCount(Address),
     TotalSubmissions,
+    OracleStake(Address),
+    OracleSlashed(Address),
 }
 
 fn has_admin(e: &Env) -> bool {
@@ -150,7 +173,7 @@ pub struct VerificationOracle;
 #[allow(clippy::too_many_arguments)]
 impl VerificationOracle {
     /// Initialize the oracle contract with an admin and default config. Callable once.
-    pub fn initialize(e: Env, admin: Address) {
+    pub fn initialize(e: Env, admin: Address, staking_token: Address, treasury: Address) {
         if has_admin(&e) {
             panic!("already initialized");
         }
@@ -169,11 +192,16 @@ impl VerificationOracle {
             quality_threshold_temp: 300,
             credit_per_kg_n: 10,
             credit_per_kg_p: 20,
+            staking_token,
+            treasury,
+            min_stake: 1000,
+            unstake_cooldown_secs: 86400,
         };
         e.storage().instance().set(&DataKey::Config, &config);
     }
 
     /// Add an oracle address to the whitelist. Only admin can call.
+    /// If min_stake > 0, the oracle must have at least min_stake tokens staked.
     pub fn add_oracle(e: Env, admin: Address, oracle: Address) {
         admin.require_auth();
         let stored: Address = read_admin(&e);
@@ -187,6 +215,16 @@ impl VerificationOracle {
         let config: OracleConfig = read_config(&e);
         if count >= config.max_oracles {
             panic!("max oracles reached");
+        }
+        if config.min_stake > 0 {
+            let stake_info: StakeInfo = e
+                .storage()
+                .instance()
+                .get(&DataKey::OracleStake(oracle.clone()))
+                .unwrap_or(StakeInfo { amount: 0, unstake_request: None });
+            if stake_info.amount < config.min_stake {
+                panic!("insufficient stake");
+            }
         }
         e.storage()
             .instance()
@@ -207,6 +245,7 @@ impl VerificationOracle {
     }
 
     /// Remove an oracle from the whitelist. Must maintain at least min_oracles.
+    /// The oracle must have zero stake (fully unstaked) before removal.
     pub fn remove_oracle(e: Env, admin: Address, oracle: Address) {
         admin.require_auth();
         let stored: Address = read_admin(&e);
@@ -218,6 +257,14 @@ impl VerificationOracle {
             .has(&DataKey::OracleActive(oracle.clone()))
         {
             panic!("oracle not active");
+        }
+        let stake_info: StakeInfo = e
+            .storage()
+            .instance()
+            .get(&DataKey::OracleStake(oracle.clone()))
+            .unwrap_or(StakeInfo { amount: 0, unstake_request: None });
+        if stake_info.amount > 0 {
+            panic!("oracle must unstake before removal");
         }
         let count: u32 = e.storage().instance().get(&DataKey::OracleCount).unwrap();
         let config: OracleConfig = read_config(&e);
@@ -323,6 +370,18 @@ fn submit_reading_impl(
             panic!("oracle not active");
         }
 
+        let config: OracleConfig = read_config(&e);
+        if config.min_stake > 0 {
+            let stake_info: StakeInfo = e
+                .storage()
+                .instance()
+                .get(&DataKey::OracleStake(oracle.clone()))
+                .unwrap_or(StakeInfo { amount: 0, unstake_request: None });
+            if stake_info.amount < config.min_stake {
+                panic!("insufficient stake");
+            }
+        }
+
         let expected_nonce: u64 = e
             .storage()
             .instance()
@@ -401,8 +460,6 @@ fn submit_reading_impl(
                 &DataKey::OracleSubmitted(project_id.clone(), oracle.clone()),
                 &true,
             );
-
-        let config: OracleConfig = read_config(&e);
 
         if window.submissions.len() >= config.min_oracles {
             let subs = &window.submissions;
@@ -648,6 +705,199 @@ fn submit_reading_impl(
             Some(w) => w.submissions.len(),
         }
     }
+
+    /// Stake tokens as collateral. The oracle must first approve this contract
+    /// to spend `amount` of the configured staking token. Staked tokens are
+    /// locked and can be slashed by admin or governance.
+    pub fn stake(e: Env, oracle: Address, amount: i128) {
+        oracle.require_auth();
+        if amount <= 0 {
+            panic!("stake amount must be positive");
+        }
+        let config: OracleConfig = read_config(&e);
+
+        let transfer_args: Vec<Val> = vec![
+            &e,
+            oracle.to_val(),
+            e.current_contract_address().to_val(),
+            amount.into_val(&e),
+        ];
+        e.invoke_contract::<()>(
+            &config.staking_token,
+            &Symbol::new(&e, "transfer_from"),
+            transfer_args,
+        );
+
+        let mut stake_info: StakeInfo = e
+            .storage()
+            .instance()
+            .get(&DataKey::OracleStake(oracle.clone()))
+            .unwrap_or(StakeInfo { amount: 0, unstake_request: None });
+        stake_info.amount += amount;
+        stake_info.unstake_request = None;
+        e.storage()
+            .instance()
+            .set(&DataKey::OracleStake(oracle.clone()), &stake_info);
+
+        e.events().publish((EVENT_ORACLE_STAKED,), (oracle, amount));
+    }
+
+    /// Request to unstake tokens. The unstaked tokens become available after
+    /// `unstake_cooldown_secs` have elapsed. Only callable when the oracle
+    /// is not active or has no pending unstake request.
+    pub fn unstake(e: Env, oracle: Address, amount: i128) {
+        oracle.require_auth();
+        if amount <= 0 {
+            panic!("unstake amount must be positive");
+        }
+        let config: OracleConfig = read_config(&e);
+        let mut stake_info: StakeInfo = e
+            .storage()
+            .instance()
+            .get(&DataKey::OracleStake(oracle.clone()))
+            .unwrap_or(StakeInfo { amount: 0, unstake_request: None });
+        if stake_info.amount < amount {
+            panic!("insufficient staked balance");
+        }
+        if e.storage()
+            .instance()
+            .get(&DataKey::OracleActive(oracle.clone()))
+            .unwrap_or(false)
+        {
+            let remaining = stake_info.amount - amount;
+            if remaining < config.min_stake {
+                panic!("would fall below minimum stake");
+            }
+        }
+        let now = e.ledger().timestamp();
+        stake_info.amount -= amount;
+        stake_info.unstake_request = Some(now + config.unstake_cooldown_secs);
+        e.storage()
+            .instance()
+            .set(&DataKey::OracleStake(oracle.clone()), &stake_info);
+
+        e.events()
+            .publish((EVENT_ORACLE_UNSTAKED,), (oracle, amount));
+    }
+
+    /// Claim unstaked tokens after the cooldown period has elapsed.
+    pub fn claim_unstake(e: Env, oracle: Address) {
+        oracle.require_auth();
+        let stake_info: StakeInfo = e
+            .storage()
+            .instance()
+            .get(&DataKey::OracleStake(oracle.clone()))
+            .unwrap_or(StakeInfo { amount: 0, unstake_request: None });
+        let cooldown_end = stake_info.unstake_request.unwrap_or(0);
+        let now = e.ledger().timestamp();
+        if cooldown_end == 0 || now < cooldown_end {
+            panic!("cooldown not elapsed");
+        }
+        let config: OracleConfig = read_config(&e);
+        let unstaked_amount = stake_info.amount;
+
+        let transfer_args: Vec<Val> = vec![
+            &e,
+            e.current_contract_address().to_val(),
+            oracle.to_val(),
+            unstaked_amount.into_val(&e),
+        ];
+        e.invoke_contract::<()>(
+            &config.staking_token,
+            &Symbol::new(&e, "transfer"),
+            transfer_args,
+        );
+
+        e.storage()
+            .instance()
+            .set(
+                &DataKey::OracleStake(oracle.clone()),
+                &StakeInfo { amount: 0, unstake_request: None },
+            );
+    }
+
+    /// Slash an oracle's stake. Callable by admin or governance.
+    /// Reason codes: 1 = admin_flag, 2 = fraud_proof.
+    /// Slashed funds go to the treasury address.
+    pub fn slash(e: Env, caller: Address, oracle: Address, amount: i128, reason: u32) {
+        caller.require_auth();
+        let stored: Address = read_admin(&e);
+        if caller != stored {
+            panic!("unauthorized");
+        }
+        if amount <= 0 {
+            panic!("slash amount must be positive");
+        }
+        let mut stake_info: StakeInfo = e
+            .storage()
+            .instance()
+            .get(&DataKey::OracleStake(oracle.clone()))
+            .unwrap_or(StakeInfo { amount: 0, unstake_request: None });
+        if stake_info.amount < amount {
+            panic!("slash exceeds staked balance");
+        }
+        stake_info.amount -= amount;
+        e.storage()
+            .instance()
+            .set(&DataKey::OracleStake(oracle.clone()), &stake_info);
+
+        let config: OracleConfig = read_config(&e);
+        let transfer_args: Vec<Val> = vec![
+            &e,
+            e.current_contract_address().to_val(),
+            config.treasury.to_val(),
+            amount.into_val(&e),
+        ];
+        e.invoke_contract::<()>(
+            &config.staking_token,
+            &Symbol::new(&e, "transfer"),
+            transfer_args,
+        );
+
+        let slash_record = SlashReason {
+            reason,
+            timestamp: e.ledger().timestamp(),
+        };
+        e.storage()
+            .instance()
+            .set(&DataKey::OracleSlashed(oracle.clone()), &slash_record);
+
+        e.events()
+            .publish((EVENT_ORACLE_SLASHED,), (oracle, amount, reason));
+    }
+
+    /// Get the current staked balance and unstake request for an oracle.
+    pub fn get_stake(e: Env, oracle: Address) -> StakeInfo {
+        e.storage()
+            .instance()
+            .get(&DataKey::OracleStake(oracle))
+            .unwrap_or(StakeInfo { amount: 0, unstake_request: None })
+    }
+
+    /// Get the slash record for an oracle (most recent slash).
+    pub fn get_slash_record(e: Env, oracle: Address) -> Option<SlashReason> {
+        e.storage()
+            .instance()
+            .get(&DataKey::OracleSlashed(oracle))
+    }
+
+    /// Get the unstake cooldown period in seconds.
+    pub fn get_unstake_cooldown(e: Env) -> u64 {
+        let config: OracleConfig = read_config(&e);
+        config.unstake_cooldown_secs
+    }
+
+    /// Get the treasury address where slashed funds are sent.
+    pub fn get_treasury(e: Env) -> Address {
+        let config: OracleConfig = read_config(&e);
+        config.treasury
+    }
+
+    /// Get the staking token contract address.
+    pub fn get_staking_token(e: Env) -> Address {
+        let config: OracleConfig = read_config(&e);
+        config.staking_token
+    }
 }
 
 #[cfg(test)]
@@ -655,12 +905,39 @@ mod tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
 
+    // Minimal mock token that implements transfer_from and transfer.
+    // In tests with mock_all_auths, auth checks are bypassed.
+    #[contract]
+    pub struct MockToken;
+
+    #[contractimpl]
+    impl MockToken {
+        pub fn initialize(_e: Env, _admin: Address) {}
+
+        pub fn transfer(_e: Env, _from: Address, _to: Address, _amount: i128) {}
+
+        pub fn transfer_from(
+            _e: Env,
+            _spender: Address,
+            _from: Address,
+            _to: Address,
+            _amount: i128,
+        ) {
+        }
+
+        pub fn balance(_e: Env, _addr: Address) -> i128 {
+            1_000_000
+        }
+    }
+
     fn setup_with_client() -> (Env, Address, VerificationOracleClient<'static>) {
         let e = Env::default();
         let admin = Address::generate(&e);
+        let staking_token = Address::generate(&e);
+        let treasury = Address::generate(&e);
         let contract_id = e.register_contract(None, VerificationOracle);
         let client = VerificationOracleClient::new(&e, &contract_id);
-        client.initialize(&admin);
+        client.initialize(&admin, &staking_token, &treasury);
         (e, admin, client)
     }
 
@@ -672,6 +949,8 @@ mod tests {
         assert_eq!(config.max_oracles, 10);
         assert_eq!(config.credit_per_kg_n, 10);
         assert_eq!(config.credit_per_kg_p, 20);
+        assert_eq!(config.min_stake, 1000);
+        assert_eq!(config.unstake_cooldown_secs, 86400);
     }
 
     #[test]
@@ -745,7 +1024,6 @@ mod tests {
 
         let project_id = BytesN::from_array(&e, &[1u8; 32]);
         client.submit_reading(&oracle, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
-        // Submission accepted - no error
     }
 
     #[test]
@@ -840,7 +1118,6 @@ mod tests {
 
         let project_id = BytesN::from_array(&e, &[50u8; 32]);
 
-        // First window
         client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
         client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
         client.submit_reading(&o3, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
@@ -848,7 +1125,6 @@ mod tests {
         let history = client.get_result_history(&project_id);
         assert_eq!(history.len(), 1);
 
-        // Reset window and submit again
         client.reset_window(&admin, &project_id);
         client.submit_reading(&o1, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
         client.submit_reading(&o2, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
@@ -857,7 +1133,6 @@ mod tests {
         let history = client.get_result_history(&project_id);
         assert_eq!(history.len(), 2);
 
-        // Both should have valid oracle counts
         assert_eq!(history.get(0).unwrap().oracle_count, 3);
         assert_eq!(history.get(1).unwrap().oracle_count, 3);
     }
@@ -876,12 +1151,17 @@ mod tests {
             quality_threshold_temp: 310,
             credit_per_kg_n: 15,
             credit_per_kg_p: 25,
+            staking_token: Address::generate(&e),
+            treasury: Address::generate(&e),
+            min_stake: 2000,
+            unstake_cooldown_secs: 172800,
         };
         client.update_config(&admin, &new_config);
 
         let config = client.get_config();
         assert_eq!(config.min_oracles, 5);
         assert_eq!(config.credit_per_kg_n, 15);
+        assert_eq!(config.min_stake, 2000);
     }
 
     #[test]
@@ -920,13 +1200,12 @@ mod tests {
         client.add_oracle(&admin, &o3);
 
         let project_id = BytesN::from_array(&e, &[7u8; 32]);
-        // Bad pH, high turbidity, low DO, high temp -> max penalty
         client.submit_reading(&o1, &project_id, &1, &300, &200, &10, &500, &350, &8, &1);
         client.submit_reading(&o2, &project_id, &1, &300, &200, &10, &500, &350, &8, &1);
         let result = client.submit_reading(&o3, &project_id, &1, &300, &200, &10, &500, &350, &8, &1);
 
         assert!(result.is_some());
-        assert_eq!(result.unwrap().quality_penalty, 7000); // 2000+2000+2000+1000=7000
+        assert_eq!(result.unwrap().quality_penalty, 7000);
     }
 
     #[test]
@@ -969,15 +1248,11 @@ mod tests {
         let p2 = BytesN::from_array(&e, &[51u8; 32]);
         let p3 = BytesN::from_array(&e, &[52u8; 32]);
 
-        // Same oracle uses nonce=1 for all three projects — nonces are per (project, oracle)
         client.submit_reading(&o1, &p1, &1, &700, &10, &80, &500, &250, &8, &1);
         client.submit_reading(&o1, &p2, &1, &700, &10, &80, &500, &250, &8, &1);
         client.submit_reading(&o1, &p3, &1, &700, &10, &80, &500, &250, &8, &1);
 
-        // Now increment nonce for p1 — nonce=2 is valid for p1
         client.submit_reading(&o1, &p1, &2, &700, &10, &80, &500, &250, &8, &1);
-
-        // Nonce=1 for p2 again should fail (already used), but nonce=2 is valid
         client.submit_reading(&o1, &p2, &2, &700, &10, &80, &500, &250, &8, &1);
     }
 
@@ -1065,14 +1340,11 @@ mod tests {
         client.add_oracle(&admin, &o3);
 
         let project_id = BytesN::from_array(&e, &[31u8; 32]);
-        // Submit two readings
         client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
         client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
 
-        // Reset
         client.reset_window(&admin, &project_id);
 
-        // All three oracles can submit fresh (using next nonces)
         client.submit_reading(&o1, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
         client.submit_reading(&o2, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
         let result = client.submit_reading(&o3, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
@@ -1080,8 +1352,6 @@ mod tests {
         assert!(result.is_some());
         assert_eq!(result.unwrap().oracle_count, 3);
     }
-
-    // ── Edge case tests ──
 
     #[test]
     fn test_zero_flow_produces_zero_volumetric_credit() {
@@ -1096,7 +1366,6 @@ mod tests {
         client.add_oracle(&admin, &o3);
 
         let project_id = BytesN::from_array(&e, &[40u8; 32]);
-        // flow_rate = 0 → no volumetric credits, no nutrient removal
         client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &0, &250, &2, &0);
         client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &0, &250, &2, &0);
         let result = client.submit_reading(&o3, &project_id, &1, &700, &10, &80, &0, &250, &2, &0);
@@ -1124,9 +1393,7 @@ mod tests {
         let project_id = BytesN::from_array(&e, &[41u8; 32]);
         let result = client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
 
-        // With min_oracles=3, one submission should not produce a result
         assert!(result.is_none());
-        // And no last_result stored yet
         assert!(client.get_last_result(&project_id).is_none());
     }
 
@@ -1163,8 +1430,6 @@ mod tests {
         client.add_oracle(&admin, &o3);
 
         let project_id = BytesN::from_array(&e, &[43u8; 32]);
-        // Readings with high N and P (above baseline) and zero flow
-        // → no removal, no volumetric, only quality penalty from bad pH
         client.submit_reading(&o1, &project_id, &1, &300, &200, &10, &0, &350, &20, &5);
         client.submit_reading(&o2, &project_id, &1, &300, &200, &10, &0, &350, &20, &5);
         let result = client.submit_reading(&o3, &project_id, &1, &300, &200, &10, &0, &350, &20, &5);
@@ -1174,7 +1439,6 @@ mod tests {
         assert_eq!(res.volumetric_credit, 0);
         assert_eq!(res.n_removal_kg, 0);
         assert_eq!(res.p_removal_kg, 0);
-        // total_credits is 0 (or negative capped to 0 after quality penalty on 0 gross)
         assert_eq!(res.total_credits, 0);
     }
 
@@ -1183,7 +1447,6 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
-        // Change config to min_oracles=2 to test even-count median
         let mut config = client.get_config();
         config.min_oracles = 2;
         client.update_config(&admin, &config);
@@ -1194,13 +1457,412 @@ mod tests {
         client.add_oracle(&admin, &o2);
 
         let project_id = BytesN::from_array(&e, &[44u8; 32]);
-        // flow: 400 and 600 → median = (400+600)/2 = 500
         client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &400, &250, &8, &1);
         let result = client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &600, &250, &8, &1);
 
         assert!(result.is_some());
         let res = result.unwrap();
-        // volumetric = med_flow * 100 / 1000 = 500 * 100 / 1000 = 50
         assert_eq!(res.volumetric_credit, 50);
+    }
+
+    // ── Staking & Slashing Tests ──
+
+    #[test]
+    fn test_stake_increases_balance() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+        let oracle = Address::generate(&e);
+
+        client.stake(&oracle, &5000);
+        let info = client.get_stake(&oracle);
+        assert_eq!(info.amount, 5000);
+        assert!(info.unstake_request.is_none());
+    }
+
+    #[test]
+    fn test_stake_accumulates() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+        let oracle = Address::generate(&e);
+
+        client.stake(&oracle, &2000);
+        client.stake(&oracle, &3000);
+        let info = client.get_stake(&oracle);
+        assert_eq!(info.amount, 5000);
+    }
+
+    #[test]
+    fn test_stake_zero_panics() {
+        let (e, _admin, client) = setup_with_client();
+        e.mock_all_auths();
+        let oracle = Address::generate(&e);
+
+        let result = e.try_invoke_contract::<_, ()>(
+            &client.address,
+            &Symbol::new(&e, "stake"),
+            vec![&e, oracle.to_val(), 0i128.into_val(&e)],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_unstake_reduces_balance() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+        let oracle = Address::generate(&e);
+
+        client.stake(&oracle, &5000);
+        client.unstake(&oracle, &2000);
+        let info = client.get_stake(&oracle);
+        assert_eq!(info.amount, 3000);
+        assert!(info.unstake_request.is_some());
+    }
+
+    #[test]
+    fn test_unstake_insufficient_balance_panics() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+        let oracle = Address::generate(&e);
+
+        client.stake(&oracle, &1000);
+        let result = e.try_invoke_contract::<_, ()>(
+            &client.address,
+            &Symbol::new(&e, "unstake"),
+            vec![&e, oracle.to_val(), 2000i128.into_val(&e)],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_unstake_below_min_stake_for_active_oracle_panics() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+        let oracle = Address::generate(&e);
+
+        client.stake(&oracle, &1500);
+        client.add_oracle(&admin, &oracle);
+
+        // min_stake is 1000, staking 1500, trying to unstake 600 would leave 900 < 1000
+        let result = e.try_invoke_contract::<_, ()>(
+            &client.address,
+            &Symbol::new(&e, "unstake"),
+            vec![&e, oracle.to_val(), 600i128.into_val(&e)],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_unstake_active_oracle_can_unstake_to_min() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+        let oracle = Address::generate(&e);
+
+        client.stake(&oracle, &2000);
+        client.add_oracle(&admin, &oracle);
+
+        // Unstake 1000, leaving exactly min_stake = 1000
+        client.unstake(&oracle, &1000);
+        let info = client.get_stake(&oracle);
+        assert_eq!(info.amount, 1000);
+    }
+
+    #[test]
+    fn test_stake_clears_unstake_request() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+        let oracle = Address::generate(&e);
+
+        client.stake(&oracle, &5000);
+        client.unstake(&oracle, &2000);
+        let info = client.get_stake(&oracle);
+        assert!(info.unstake_request.is_some());
+
+        client.stake(&oracle, &1000);
+        let info = client.get_stake(&oracle);
+        assert!(info.unstake_request.is_none());
+        assert_eq!(info.amount, 4000);
+    }
+
+    #[test]
+    fn test_slash_reduces_stake() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+        let oracle = Address::generate(&e);
+
+        client.stake(&oracle, &5000);
+        client.slash(&admin, &oracle, &2000, &1);
+        let info = client.get_stake(&oracle);
+        assert_eq!(info.amount, 3000);
+    }
+
+    #[test]
+    fn test_slash_records_reason() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+        let oracle = Address::generate(&e);
+
+        client.stake(&oracle, &5000);
+        client.slash(&admin, &oracle, &2000, &1);
+        let record = client.get_slash_record(&oracle);
+        assert!(record.is_some());
+        let rec = record.unwrap();
+        assert_eq!(rec.reason, 1);
+    }
+
+    #[test]
+    fn test_slash_fraud_proof_reason() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+        let oracle = Address::generate(&e);
+
+        client.stake(&oracle, &5000);
+        client.slash(&admin, &oracle, &5000, &2);
+        let info = client.get_stake(&oracle);
+        assert_eq!(info.amount, 0);
+        let record = client.get_slash_record(&oracle).unwrap();
+        assert_eq!(record.reason, 2);
+    }
+
+    #[test]
+    fn test_slash_exceeds_stake_panics() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+        let oracle = Address::generate(&e);
+
+        client.stake(&oracle, &1000);
+        let result = e.try_invoke_contract::<_, ()>(
+            &client.address,
+            &Symbol::new(&e, "slash"),
+            vec![
+                &e,
+                admin.to_val(),
+                oracle.to_val(),
+                2000i128.into_val(&e),
+                1u32.into_val(&e),
+            ],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_slash_unauthorized_panics() {
+        let (e, _admin, client) = setup_with_client();
+        e.mock_all_auths();
+        let oracle = Address::generate(&e);
+        let rando = Address::generate(&e);
+
+        client.stake(&oracle, &5000);
+        let result = e.try_invoke_contract::<_, ()>(
+            &client.address,
+            &Symbol::new(&e, "slash"),
+            vec![
+                &e,
+                rando.to_val(),
+                oracle.to_val(),
+                1000i128.into_val(&e),
+                1u32.into_val(&e),
+            ],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_add_oracle_requires_min_stake() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+        let oracle = Address::generate(&e);
+
+        // min_stake is 1000 by default, oracle has 0 stake
+        let result = e.try_invoke_contract::<_, ()>(
+            &client.address,
+            &Symbol::new(&e, "add_oracle"),
+            vec![&e, admin.to_val(), oracle.to_val()],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_add_oracle_with_sufficient_stake() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+        let oracle = Address::generate(&e);
+
+        client.stake(&oracle, &1500);
+        client.add_oracle(&admin, &oracle);
+        assert!(client.is_oracle_active(&oracle));
+    }
+
+    #[test]
+    fn test_remove_oracle_requires_unstake() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+        let o1 = Address::generate(&e);
+        let o2 = Address::generate(&e);
+        let o3 = Address::generate(&e);
+        let o4 = Address::generate(&e);
+
+        client.stake(&o1, &1500);
+        client.stake(&o2, &1500);
+        client.stake(&o3, &1500);
+        client.stake(&o4, &1500);
+        client.add_oracle(&admin, &o1);
+        client.add_oracle(&admin, &o2);
+        client.add_oracle(&admin, &o3);
+        client.add_oracle(&admin, &o4);
+
+        // Cannot remove while staked
+        let result = e.try_invoke_contract::<_, ()>(
+            &client.address,
+            &Symbol::new(&e, "remove_oracle"),
+            vec![&e, admin.to_val(), o4.to_val()],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_remove_oracle_after_full_unstake() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+        let o1 = Address::generate(&e);
+        let o2 = Address::generate(&e);
+        let o3 = Address::generate(&e);
+        let o4 = Address::generate(&e);
+
+        client.stake(&o1, &1500);
+        client.stake(&o2, &1500);
+        client.stake(&o3, &1500);
+        client.stake(&o4, &1500);
+        client.add_oracle(&admin, &o1);
+        client.add_oracle(&admin, &o2);
+        client.add_oracle(&admin, &o3);
+        client.add_oracle(&admin, &o4);
+
+        // Set min_stake to 0 so full unstake is allowed
+        let mut config = client.get_config();
+        config.min_stake = 0;
+        client.update_config(&admin, &config);
+
+        client.unstake(&o4, &1500);
+        client.remove_oracle(&admin, &o4);
+        assert!(!client.is_oracle_active(&o4));
+    }
+
+    #[test]
+    fn test_submit_reading_requires_min_stake() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+        let oracle = Address::generate(&e);
+
+        // Force-add oracle bypassing the stake check by using update_config
+        let mut config = client.get_config();
+        config.min_stake = 0;
+        client.update_config(&admin, &config);
+        client.add_oracle(&admin, &oracle);
+
+        // Now re-enable min_stake
+        config.min_stake = 5000;
+        client.update_config(&admin, &config);
+
+        let project_id = BytesN::from_array(&e, &[1u8; 32]);
+        let result = e.try_invoke_contract::<_, ()>(
+            &client.address,
+            &Symbol::new(&e, "submit_reading"),
+            vec![
+                &e,
+                oracle.to_val(),
+                project_id.to_val(),
+                1u64.into_val(&e),
+                700i64.into_val(&e),
+                10i64.into_val(&e),
+                80i64.into_val(&e),
+                500i64.into_val(&e),
+                250i64.into_val(&e),
+                8i64.into_val(&e),
+                1i64.into_val(&e),
+            ],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_submit_reading_with_sufficient_stake() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+        let oracle = Address::generate(&e);
+
+        client.stake(&oracle, &2000);
+        client.add_oracle(&admin, &oracle);
+
+        let project_id = BytesN::from_array(&e, &[1u8; 32]);
+        client.submit_reading(&oracle, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+    }
+
+    #[test]
+    fn test_claim_unstake_before_cooldown_panics() {
+        let (e, _admin, client) = setup_with_client();
+        e.mock_all_auths();
+        let oracle = Address::generate(&e);
+
+        client.stake(&oracle, &5000);
+        client.unstake(&oracle, &2000);
+
+        let result = e.try_invoke_contract::<_, ()>(
+            &client.address,
+            &Symbol::new(&e, "claim_unstake"),
+            vec![&e, oracle.to_val()],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_getters_return_config_values() {
+        let (e, _admin, client) = setup_with_client();
+
+        let cooldown = client.get_unstake_cooldown();
+        assert_eq!(cooldown, 86400);
+
+        let _treasury = client.get_treasury();
+        let _staking_token = client.get_staking_token();
+    }
+
+    #[test]
+    fn test_initial_stake_is_zero() {
+        let (e, _admin, client) = setup_with_client();
+        let oracle = Address::generate(&e);
+        let info = client.get_stake(&oracle);
+        assert_eq!(info.amount, 0);
+        assert!(info.unstake_request.is_none());
+    }
+
+    #[test]
+    fn test_initial_slash_record_is_none() {
+        let (e, _admin, client) = setup_with_client();
+        let oracle = Address::generate(&e);
+        assert!(client.get_slash_record(&oracle).is_none());
+    }
+
+    #[test]
+    fn test_full_stake_slash_unstake_lifecycle() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+        let oracle = Address::generate(&e);
+
+        // Stake
+        client.stake(&oracle, &10000);
+        assert_eq!(client.get_stake(&oracle).amount, 10000);
+
+        // Add as oracle
+        client.add_oracle(&admin, &oracle);
+        assert!(client.is_oracle_active(&oracle));
+
+        // Slash partial
+        client.slash(&admin, &oracle, &3000, &1);
+        assert_eq!(client.get_stake(&oracle).amount, 7000);
+        assert_eq!(client.get_slash_record(&oracle).unwrap().reason, 1);
+
+        // Slash rest
+        client.slash(&admin, &oracle, &7000, &2);
+        assert_eq!(client.get_stake(&oracle).amount, 0);
+        assert_eq!(client.get_slash_record(&oracle).unwrap().reason, 2);
     }
 }

@@ -681,7 +681,7 @@ Given:
 | **Single oracle manipulation** | Multi-oracle median (N ≥ 2 required) |
 | **Replay attacks** | Monotonically increasing nonce per (project, oracle) pair |
 | **Stale data** | Stellar time bounds on oracle transactions |
-| **Oracle collusion** | Staking + slashing (future version); independent operators |
+| **Oracle collusion** | Staking + slashing; independent operators |
 | **Sensor spoofing** | ECDSA-signed sensor payloads verified by edge gateway |
 
 ### Access Control

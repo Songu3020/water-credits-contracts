@@ -142,14 +142,56 @@ total = gross * (10_000 - quality_penalty) / 10_000
 
 All sensor values are fixed-point integers (see MATH.md for scale factors).
 
+#### Oracle staking and slashing
+
+Oracles must stake tokens as collateral before being whitelisted. Staked
+tokens are held by the oracle contract and can be slashed by admin if the
+oracle submits fraudulent readings.
+
+**Staking lifecycle:**
+
+1. **Stake** — Oracle calls `stake(amount)`, which pulls tokens from the
+   oracle via `transfer_from` on the configured staking token contract.
+   Stake accumulates across multiple calls. Any pending unstake request
+   is cancelled.
+2. **Unstake** — Oracle calls `unstake(amount)`. If the oracle is active,
+   the remaining stake must stay at or above `min_stake`. A cooldown
+   timer (`unstake_cooldown_secs`) begins.
+3. **Claim** — After the cooldown elapses, the oracle calls
+   `claim_unstake()` to receive the unstaked tokens back via `transfer`.
+
+**Slashing:**
+
+- Admin calls `slash(admin, oracle, amount, reason)` to penalize an oracle.
+- Reason codes: `1` = admin flag, `2` = fraud proof.
+- Slashed funds are transferred to the treasury address.
+- Slashing does not auto-remove the oracle from the whitelist; admin can
+  separately call `remove_oracle`.
+
+**Enforcement points:**
+
+- `add_oracle` requires `stake >= min_stake` when `min_stake > 0`.
+- `remove_oracle` requires `stake == 0` (oracle must unstake first).
+- `submit_reading` requires `stake >= min_stake` when `min_stake > 0`.
+
 #### Public interface additions (this version)
 
 | Function | Auth | Description |
 |---|---|---|
+| `initialize(admin, staking_token, treasury)` | None (once) | Set up oracle contract with staking token and treasury |
 | `reset_window(admin, project_id)` | admin | Clear pending window so oracles can resubmit |
 | `window_submission_count(project_id)` | — | Current pending submission count |
 | `oracle_submit_count(oracle)` | — | Lifetime submission count for an oracle |
 | `total_submissions()` | — | Global lifetime submission count |
+| `stake(oracle, amount)` | oracle | Lock tokens as collateral |
+| `unstake(oracle, amount)` | oracle | Begin cooldown withdrawal |
+| `claim_unstake(oracle)` | oracle | Withdraw tokens after cooldown |
+| `slash(caller, oracle, amount, reason)` | admin | Penalize oracle, send funds to treasury |
+| `get_stake(oracle)` | — | Current stake info (amount, unstake request) |
+| `get_slash_record(oracle)` | — | Most recent slash record |
+| `get_unstake_cooldown()` | — | Cooldown period in seconds |
+| `get_treasury()` | — | Treasury address |
+| `get_staking_token()` | — | Staking token contract address |
 
 ---
 
@@ -263,6 +305,8 @@ approval threshold.
 | `WindowState(BytesN<32>)` | `WindowState` | Open/finalized window |
 | `LastResult(BytesN<32>)` | `VerificationResult` | Latest finalized result |
 | `ProjectConfig(BytesN<32>)` | `ProjectConfig` | Auto-mint config |
+| `OracleStake(Address)` | `StakeInfo` | Oracle stake amount and unstake request |
+| `OracleSlashed(Address)` | `SlashReason` | Most recent slash record |
 
 ### retirement_registry
 
@@ -291,6 +335,12 @@ The following properties must hold at all times:
    append-only; no record is ever modified or deleted
 6. **Deduplication**: An oracle cannot submit twice to the same open window
    for the same project
+7. **Stake conservation**: The sum of all `OracleStake.amount` values plus
+   all tokens held by the contract equals the total tokens transferred in
+   via `stake` minus tokens transferred out via `unstake`/`slash`
+8. **Min stake enforcement**: An active oracle always has
+   `OracleStake.amount >= config.min_stake` (when `min_stake > 0`)
+9. **Slash bounds**: `slash` panics if `amount > oracle.stake.amount`
 
 ---
 
@@ -303,6 +353,9 @@ The following properties must hold at all times:
 | `retired` | `credit_token` | `(holder, amount, certificate)` | Retire |
 | `proj_reg` | `credit_factory` | `(project_id,)` | Project registered |
 | `rdng_vrfy` | `verification_oracle` | `(project_id, result)` | Window finalized |
+| `orc_stk` | `verification_oracle` | `(oracle, amount)` | Oracle stakes tokens |
+| `orc_unst` | `verification_oracle` | `(oracle, amount)` | Oracle requests unstake |
+| `orc_slsh` | `verification_oracle` | `(oracle, amount, reason)` | Oracle stake slashed |
 | `prop_crt` | `governance` | `(proposal_id, proposer)` | Proposal created |
 | `vote_cst` | `governance` | `(proposal_id, voter, approve)` | Vote cast |
 | `prop_exe` | `governance` | `(proposal_id,)` | Proposal executed |

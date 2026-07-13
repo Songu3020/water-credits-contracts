@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Oracle staking and slashing mechanism in `verification_oracle`
+- `stake`, `unstake`, `claim_unstake`, `slash` functions
+- Admin-only `slash` with reason codes (admin flag / fraud proof)
+- Slashed funds sent to configurable treasury address
+- Cooldown-based unstaking with configurable delay
+- Min-stake enforcement on `add_oracle` and `submit_reading`
+- Oracle must fully unstake before removal
+- Events: `orc_stk`, `orc_unst`, `orc_slsh`
+- Staking getters: `get_stake`, `get_slash_record`, `get_unstake_cooldown`, `get_treasury`, `get_staking_token`
 - Emergency pause propagation across all contracts
 - Batch transfer support in `credit_token`
 - Allowance expiration in `credit_token`
