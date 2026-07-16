@@ -16,8 +16,19 @@
 
 ---
 
+## 🌍 Why This Exists
+
+Water ecosystems — wetlands, rivers, and watersheds — provide services worth trillions of dollars annually, yet their degradation goes largely uncompensated. The Water Quality & Replenishment Credits protocol bridges that gap by turning **measurable, sensor-verified improvements in water quality** into tradeable on-chain credits.
+
+A project developer installs IoT sensors at a restoration site. When sensors report cleaner water (lower nitrogen, lower phosphorus, better dissolved oxygen), oracle nodes verify the data and the protocol mints credits representing that impact. Those credits can be transferred, traded, or permanently retired by anyone who wants to demonstrate water stewardship — companies meeting compliance obligations, communities investing in local watersheds, or individuals offsetting their footprint.
+
+This repository is the **on-chain layer**: six Soroban smart contracts that guarantee the issuance, accounting, and retirement of those credits are transparent, tamper-proof, and auditable.
+
+---
+
 ## 📋 Table of Contents
 
+- [Why This Exists](#-why-this-exists)
 - [Overview](#-overview)
 - [Contract Architecture](#-contract-architecture)
 - [Contract Specifications](#-contract-specifications)
@@ -37,7 +48,9 @@
 - [Gas Optimization](#-gas-optimization)
 - [Formal Verification](#-formal-verification)
 - [Build & Run Locally](#-build--run-locally)
+- [Roadmap](#-roadmap)
 - [Contributing](#-contributing)
+- [Contact & Community](#-contact--community)
 - [License](#-license)
 
 ---
@@ -1112,7 +1125,7 @@ Core contracts (`credit_token` and `retirement_registry`) are targeted for forma
 
 ```bash
 # Clone
-git clone https://github.com/your-org/water-credits-contracts
+git clone https://github.com/water-credits/water-credits-contracts
 cd water-credits-contracts
 
 # Build
@@ -1133,6 +1146,36 @@ npx ts-node scripts/simulate_readings.ts \
 
 ---
 
+## 🗺️ Roadmap
+
+### v1.0 — Current (on testnet)
+- [x] Six core contracts: `credit_token`, `credit_factory`, `verification_oracle`, `retirement_registry`, `project_registry`, `governance`
+- [x] Single-oracle sensor reading submission
+- [x] Nonce-based replay protection
+- [x] Retirement certificates with IPFS metadata
+- [x] Multisig admin (3-of-5)
+- [x] 95%+ test coverage
+
+### v1.1 — Near-term
+- [ ] Multi-oracle median aggregation — once N oracles submit for the same `(project_id, timestamp)`, compute the median and trigger a single mint
+- [ ] Commit-reveal scheme for oracle submissions to prevent MEV frontrunning
+- [ ] `pause_project` and `pause_all` emergency controls wired to governance
+- [ ] Admin key rotation with timelock
+
+### v2.0 — Medium-term
+- [ ] Token-weighted DAO voting (transition from multisig governance)
+- [ ] Staking and slashing for oracle operators
+- [ ] On-chain credit marketplace (bid/ask order book)
+- [ ] Cross-chain bridge to EVM networks (Ethereum, Polygon)
+- [ ] Formal verification of `credit_token` and `retirement_registry` invariants using K-Framework or Dafny
+
+### Future
+- [ ] Mobile oracle node client
+- [ ] Integration with regulated carbon/water credit standards (Gold Standard, Verra)
+- [ ] Bug bounty programme (currently in development)
+
+---
+
 ## 🤝 Contributing
 
 Contributions are welcome! Please read our [Contributing Guide](CONTRIBUTING.md) to get started.
@@ -1143,7 +1186,7 @@ Before contributing, review the [Code of Conduct](CODE_OF_CONDUCT.md). For secur
 
 ```bash
 # Fork and clone
-git clone https://github.com/YOUR_USER/water-credits-contracts
+git clone https://github.com/water-credits/water-credits-contracts
 
 # Create feature branch
 git checkout -b feat/your-feature
@@ -1158,6 +1201,19 @@ git commit -m "feat: add multi-oracle median aggregation"
 # Push and create PR
 git push origin feat/your-feature
 ```
+
+---
+
+## 💬 Contact & Community
+
+| Channel | Link |
+|---|---|
+| **GitHub** | [github.com/water-credits](https://github.com/water-credits) |
+| **Telegram** | [@Escelit](https://t.me/Escelit) |
+| **Email** | [ogazipromise81@gmail.com](mailto:ogazipromise81@gmail.com) |
+| **Security reports** | See [SECURITY.md](SECURITY.md) — do not use public issues |
+
+For bugs and feature requests, open a [GitHub issue](https://github.com/water-credits/water-credits-contracts/issues) using the provided templates.
 
 ---
 

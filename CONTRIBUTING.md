@@ -29,7 +29,7 @@ By participating, you agree to uphold our [Code of Conduct](CODE_OF_CONDUCT.md).
    ```
 3. Add the upstream remote:
    ```bash
-   git remote add upstream https://github.com/your-org/water-credits-contracts
+   git remote add upstream https://github.com/water-credits/water-credits-contracts
    ```
 
 ## Development Setup
@@ -164,6 +164,18 @@ See our issue templates:
 ## Security
 
 For security vulnerabilities, please see [SECURITY.md](SECURITY.md). Do not report security issues in public GitHub issues.
+
+---
+
+## 💬 Contact & Community
+
+| Channel | Link |
+|---|---|
+| **GitHub** | [github.com/water-credits](https://github.com/water-credits) |
+| **Telegram** | [@Escelit](https://t.me/Escelit) |
+| **Email** | [ogazipromise81@gmail.com](mailto:ogazipromise81@gmail.com) |
+
+For general questions, open a [GitHub issue](https://github.com/water-credits/water-credits-contracts/issues) or reach out via Telegram.
 
 ---
 

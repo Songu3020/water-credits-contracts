@@ -11,7 +11,7 @@
 
 **Do not report security vulnerabilities in public GitHub issues.**
 
-Please report security issues via email to the project maintainers. You should receive a response within 48 hours.
+Please report security issues via email to **[ogazipromise81@gmail.com](mailto:ogazipromise81@gmail.com)**. You can also reach the maintainer on Telegram at [@Escelit](https://t.me/Escelit). You should receive a response within 48 hours.
 
 ### What to Include
 
