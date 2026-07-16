@@ -3,6 +3,17 @@ name = "tests"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+testutils = [
+    "soroban-sdk/testutils",
+    "credit_token/testutils",
+    "credit_factory/testutils",
+    "verification_oracle/testutils",
+    "retirement_registry/testutils",
+    "project_registry/testutils",
+    "governance/testutils",
+]
+
 [dependencies]
 credit_token = { path = "../contracts/credit_token", features = ["testutils"] }
 credit_factory = { path = "../contracts/credit_factory", features = ["testutils"] }
@@ -11,7 +22,7 @@ retirement_registry = { path = "../contracts/retirement_registry", features = ["
 project_registry = { path = "../contracts/project_registry", features = ["testutils"] }
 governance = { path = "../contracts/governance", features = ["testutils"] }
 shared = { path = "../contracts/shared" }
-soroban-sdk = "20.0.0"
+soroban-sdk = { version = "20.0.0", features = ["testutils"] }
 
 [lib]
 doctest = false

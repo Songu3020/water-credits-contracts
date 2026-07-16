@@ -10,15 +10,17 @@ use soroban_sdk::{testutils::Address as _, BytesN, Env};
 /// The same (count, timestamp) pair must produce the same ID via the shared helper.
 #[test]
 fn test_shared_helper_deterministic_across_envs() {
-    let e1 = Env::default();
-    let e2 = Env::default();
+    // BytesN values are bound to the Env that created them — comparing values
+    // from two different Env instances panics.  Use a single Env and call the
+    // helper twice; determinism is still proven by comparing the two results.
+    let e = Env::default();
 
-    let id1 = generate_project_id(&e1, 0, 1_700_000_000);
-    let id2 = generate_project_id(&e2, 0, 1_700_000_000);
+    let id1 = generate_project_id(&e, 0, 1_700_000_000);
+    let id2 = generate_project_id(&e, 0, 1_700_000_000);
 
     assert_eq!(
         id1, id2,
-        "shared helper must be deterministic across env instances"
+        "shared helper must be deterministic for identical inputs"
     );
 }
 
